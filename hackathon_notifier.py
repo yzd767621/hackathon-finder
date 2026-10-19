@@ -24,7 +24,7 @@ import sys
 import time
 import urllib.parse
 import webbrowser
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -154,6 +154,14 @@ def judge_location(is_online, location, text):
     if re.search(KL_STRICT, ctx, re.I) or (re.search("malaysia", ctx, re.I) and not re.search(OTHER_MY, ctx, re.I)):
         return True, "Online, offline final in KL/Malaysia: " + snippet(text, OFFLINE_FINAL, 200)
     return False, ""
+
+
+PAGE_META = r"last (modified|updated)|updated (on|at)|posted (on|by)|published|copyright|©|all rights reserved|accessed|retrieved|printed on|page (created|modified)"
+
+
+def event_dates(text):
+    """Dates in a page, minus page-housekeeping ones ("Last Modified: 19 October 2026", footers, ©)."""
+    return [d for line in text.split("\n") if not re.search(PAGE_META, line, re.I) for d in find_dates(line)]
 
 
 def find_dates(text):
@@ -616,7 +624,7 @@ def uninet_detail(h):
 
 
 SKIP_DOMAINS = r"coursera|hackathon\.com|uninet\.my|gdg\.community\.dev|hackathonradar\.com|devpost\.com|devfolio\.co|lu\.ma|luma\.com|facebook|instagram|linkedin|youtube|twitter|x\.com|tiktok|reddit|eventbrite|mlh\.(io|com)|wikipedia|threads\.net"
-GENERIC_PAGE = r"what is a hackathon|how to|guide|find .{0,20}hackathons|upcoming hackathons|hackathons worldwide|list of|directory|^hackathon$"
+GENERIC_PAGE = r"\bhackathons\b(?! ?(20\d\d|v\d))|opportunit(y|ies) (desk|for)|what is a hackathon|how to|guide|find .{0,20}hackathons|upcoming hackathons|hackathons worldwide|list of|directory|^hackathon$"
 PAST_WORDS = r"\b(secure[sd]?|wins?|won|raih|johan|juara|recap|congratulat\w*|tahniah|emerged|bags?|clinch\w*|triumph\w*|highlights)\b"
 
 
@@ -696,7 +704,7 @@ def web_detail(h):
                 text += "\n" + "\n".join(s for s in re.findall(r'"([^"\\]{4,300})"', js) if " " in s and re.search(r"[A-Za-z]{3}", s))
     if not re.search(HACK_NAME, text, re.I):
         return None
-    future = sorted(d for d in find_dates(text) if d >= date.today())
+    future = sorted(d for d in event_dates(text) if d >= date.today())
     if not future:
         return None  # no upcoming date on the page: probably over
     if title and to_text(title.group(1)):
@@ -727,8 +735,30 @@ def reject(h):
     return None
 
 
+FREE_TEXT_SOURCES = ("UniNet", "Luma", "Web", "GDG", "Hackathon Radar")
+NEVER_THE_EVENT = r"masterclass|project sharing|sharing session|preparation|prep session|briefing|info(rmation)? session|webinar|sharing session|roadshow|open day|awards? ceremony|prize[- ]giving|closing ceremony|launch(ing)? (event|ceremony)|town ?hall|watch party|career fair|recruitment"
+SIDE_EVENT = r"workshop|\btalk\b|meetup|seminar|bootcamp|masterclass|training|course|study jam|info day"
+COMPETITION = r"hackathon|buildathon|datathon|ideathon|\bCTF\b|capture the flag|challenge|competition|game jam|codefest"
+
+
+# Malaysian student-event feeds list many innovation expos / business / testing competitions; only
+# keep things that call themselves a hackathon (or a close cousin).
+STRICT_HACK = r"hack|buildathon|datathon|ideathon|codeathon|codefest|\bCTF\b|capture the flag|game jam|\bjam\b"
+SCHOOL_ONLY = r"\bschool (innovation|students?|competition|category|level)|secondary school|sekolah|primary school|\bSPM\b"
+
+
+def not_a_hackathon(title, labels=""):
+    """Briefings / webinars / workshops *about* a hackathon, non-hackathon competitions, school-pupil events."""
+    return bool(re.search(NEVER_THE_EVENT, title, re.I) or re.search(SCHOOL_ONLY, title, re.I) or
+                re.search(GENERIC_PAGE, title, re.I) or
+                not re.search(STRICT_HACK, title + " " + labels, re.I) or
+                (re.search(SIDE_EVENT, title, re.I) and not re.search(COMPETITION, title, re.I)))
+
+
 def evaluate(h, cache):
     """Fetch details, apply filters. Returns enriched dict or None."""
+    if h["source"] in FREE_TEXT_SOURCES and not_a_hackathon(h["title"], h.get("themes", "")):
+        return reject(h)
     c = cache.get(h["id"])
     if h["source"] == "Devpost":
         if c and "prizes" in c:
@@ -765,7 +795,7 @@ def evaluate(h, cache):
                 "Hackathon Radar": radar_detail}.get(h["source"], web_detail)(h)
         if text == "retry" or (text is None and h["source"] == "Luma"):  # page didn't load
             return None
-        if not text:
+        if not text or not_a_hackathon(h["title"], h.get("themes", "")):  # web pages swap in their own <title>
             return reject(h)
         h.pop("_api_id", None)
         elig = snippet(text, r"(eligib\w*|who (can|should) (join|apply|participate)|open to|kelayakan|syarat)", 300)
@@ -869,6 +899,11 @@ details ul{{margin:6px 0 0;padding-left:18px}} details li{{margin:3px 0}} .mute{
 .tag{{display:inline-block;min-width:74px;text-align:center;font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;margin-right:6px;background:var(--chip)}}
 h4{{margin:10px 0 2px;font-size:13.5px}}
 .banner{{background:var(--acc);color:#fff;padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:14px}}
+.sec{{margin-top:22px}} .sec h2{{font-size:18px;margin:0;display:flex;align-items:center;gap:8px}}
+.count{{font-size:12px;font-weight:600;background:var(--chip);color:var(--mute);border-radius:999px;padding:1px 9px}}
+.newsec{{background:var(--card);border:1px solid var(--line);border-top:3px solid #e5484d;border-radius:12px;padding:14px 14px 6px}}
+.newsec .item{{background:var(--bg)}} .newsec .count{{background:#e5484d;color:#fff}}
+.small{{font-size:13px;margin:2px 0 6px}} .found{{font-size:12px;color:#e5484d;font-weight:600;margin-left:6px}}
 </style></head><body><main><h1>Hackathon Finder</h1>
 <p class="sub">{count} free hackathons ({my_count} in Malaysia) · open to degree students · online, or in person in KL · updated {stamp}<br>
 Difficulty is an estimate and USD is converted at 1 USD = RM {rate:.2f}. Check the official rules before you register.</p>
@@ -877,16 +912,19 @@ Difficulty is an estimate and USD is converted at 1 USD = RM {rate:.2f}. Check t
 <div class="bar" data-g="level"><b>Level</b><button class="on" data-f="all">Any</button><button data-f="Beginner">Beginner</button>
 <button data-f="Intermediate">Intermediate</button><button data-f="Advanced">Advanced</button>
 <select id="sort"><option value="m">Malaysia first</option><option value="d">Deadline</option><option value="p">Biggest cash prize</option></select></div>
-<div id="list">{rows}</div></main>
+<section class="sec newsec"><h2>New this week <span class="count" data-for="new">{new_count}</span></h2>
+<p class="mute small">Found in the last 7 days{new_hint}</p><div class="list" id="new">{new_rows}</div></section>
+<section class="sec"><h2>All hackathons <span class="count" data-for="all">{all_count}</span></h2><div class="list" id="all">{rows}</div></section></main>
 <script>
-const list=document.getElementById('list'),sel={{where:'all',level:'all'}};
-function apply(){{list.querySelectorAll('.item').forEach(i=>{{const d=i.dataset,w=sel.where;
+const lists=[...document.querySelectorAll('.list')],sel={{where:'all',level:'all'}};
+function apply(){{lists.forEach(list=>{{let n=0;list.querySelectorAll('.item').forEach(i=>{{const d=i.dataset,w=sel.where;
 const okW=w==='all'||(w==='my'&&d.my==='1')||(w==='cash'&&+d.cash>0)||(w==='ai'&&d.ai==='1')||(w==='nocred'&&d.credonly!=='1');
-i.hidden=!(okW&&(sel.level==='all'||d.level===sel.level))}})}}
+i.hidden=!(okW&&(sel.level==='all'||d.level===sel.level));n+=!i.hidden}});
+document.querySelector('.count[data-for="'+list.id+'"]').textContent=n}})}}
 document.querySelectorAll('.bar[data-g]').forEach(bar=>bar.querySelectorAll('button').forEach(b=>b.onclick=()=>{{
 sel[bar.dataset.g]=b.dataset.f;bar.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));apply()}}));
-document.getElementById('sort').onchange=e=>{{const k=e.target.value;
-[...list.children].sort((a,b)=>k==='p'?b.dataset.cash-a.dataset.cash:k==='m'?(b.dataset.my-a.dataset.my)||(a.dataset.days-b.dataset.days):a.dataset.days-b.dataset.days).forEach(x=>list.appendChild(x))}};
+document.getElementById('sort').onchange=e=>{{const k=e.target.value;lists.forEach(list=>
+[...list.children].sort((a,b)=>k==='p'?b.dataset.cash-a.dataset.cash:k==='m'?(b.dataset.my-a.dataset.my)||(a.dataset.days-b.dataset.days):a.dataset.days-b.dataset.days).forEach(x=>list.appendChild(x)))}};
 </script></body></html>"""
 
 TAG_LABEL = {"cash": "CASH", "ai": "AI SUB", "credits": "CREDITS", "other": "OTHER"}
@@ -907,50 +945,66 @@ def prize_chips(p):
     return chips
 
 
-def write_report(items, new_ids):
-    e = html.escape
-    rows = []
+def found_label(first_seen):
+    days = (datetime.now(timezone.utc) - datetime.fromisoformat(first_seen)).days
+    return "found today" if days == 0 else "found yesterday" if days == 1 else f"found {days} days ago"
+
+
+def write_report(items, seen, baseline):
+    """Hackathons first seen in the last 7 days (after the initial setup batch) go in "New this week" at the top."""
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    is_new = lambda h: seen.get(h["id"], "") > max(baseline, week_ago)
+    new_rows, rows = [], []
     for h in sorted(items, key=lambda h: (not h["malaysia"], days_left(h))):
-        p, d = h["prizes"], days_left(h)
-        reqs = "".join(f"<li>{e(r)}</li>" for r in h["reqs"]) or "<li>See the event page</li>"
-        plines = "".join(
-            f'<li><span class="tag {l["cat"]}">{TAG_LABEL[l["cat"]]}</span>'
-            f'{e((l["title"] + ": ") if l["title"] and l["title"] not in l["text"] else "")}{e(l["text"])}'
-            f'{f" <span class=mute>(≈ {rm(l["rm"])})</span>" if l["rm"] and not re.search(r"RM|MYR", l["text"]) else ""}</li>'
-            for l in p["lines"]) or "<li>No prize details found, check the event page.</li>"
-        if p["cash_total"]:
-            plines = f'<li><b>Total cash: about {rm(p["cash_total"])}</b> (≈ ${p["cash_total"] / RATES["MYR"]:,.0f})</li>' + plines
-        more = " · ".join(x for x in [h["organizer"], h["dates"], f"via {h['source']}"] if x)
-        fmt = "Online" if h["mode"] == "Fully online" else h["mode"]
-        plural = "" if int(d) == 1 else "s"
-        left = h["left"] or (f"{int(d)} day{plural} left" if d < 999 and h["source"] != "Web" else f"next date in {int(d)} day{plural}" if d < 999 else "")
-        chips = (['<span class="chip mychip">Malaysia</span>'] if h["malaysia"] else []) + \
-                [f'<span class="chip {h["level"]}" title="{e(h["level_why"])}">{h["level"]}</span>'] + prize_chips(p) + \
-                [f'<span class="chip">{e(team_label(h))}</span>', f'<span class="chip">{e(fmt[:60])}</span>'] + \
-                ([f'<span class="chip">{e(left)}</span>'] if left else []) + \
-                (['<span class="chip" title="The site did not respond this time, so this is from the previous check">from last check</span>']
-                 if h.get("missed") else [])
-        new = '<span class="new">NEW</span>' if h["id"] in new_ids else ""
-        long_fmt = f'<li class="mute">Format: {e(h["mode"])}</li>' if len(fmt) > 60 else ""
-        web_note = '<li class="mute">Found by web search: details were read from the event site automatically, so double-check them.</li>' if h["source"] == "Web" else ""
-        credonly = "1" if p["credits"] and not p["cash"] and not p["ai"] else "0"
-        rows.append(f"""<div class="item{' my' if h['malaysia'] else ''}" data-level="{h['level']}" data-cash="{p['cash_top']:.0f}" data-ai="{int(p['ai'])}" data-credonly="{credonly}" data-my="{int(h['malaysia'])}" data-days="{d}">
+        (new_rows if is_new(h) else rows).append(item_html(h, found_label(seen[h["id"]]) if is_new(h) else ""))
+    REPORT_FILE.write_text(PAGE.format(
+        count=len(items), my_count=sum(h["malaysia"] for h in items), rate=RATES["MYR"],
+        new_count=len(new_rows), all_count=len(rows),
+        new_hint="" if new_rows else ". Nothing new yet: the app checks every day and will notify you.",
+        new_rows="".join(new_rows), rows="".join(rows) or "<p>No matching hackathons right now.</p>",
+        stamp=datetime.now().strftime("%d %b %Y, %H:%M")), encoding="utf-8")
+
+
+def item_html(h, found):
+    e = html.escape
+    p, d = h["prizes"], days_left(h)
+    reqs = "".join(f"<li>{e(r)}</li>" for r in h["reqs"]) or "<li>See the event page</li>"
+    plines = "".join(
+        f'<li><span class="tag {l["cat"]}">{TAG_LABEL[l["cat"]]}</span>'
+        f'{e((l["title"] + ": ") if l["title"] and l["title"] not in l["text"] else "")}{e(l["text"])}'
+        f'{f" <span class=mute>(≈ {rm(l["rm"])})</span>" if l["rm"] and not re.search(r"RM|MYR", l["text"]) else ""}</li>'
+        for l in p["lines"]) or "<li>No prize details found, check the event page.</li>"
+    if p["cash_total"]:
+        plines = f'<li><b>Total cash: about {rm(p["cash_total"])}</b> (≈ ${p["cash_total"] / RATES["MYR"]:,.0f})</li>' + plines
+    more = " · ".join(x for x in [h["organizer"], h["dates"], f"via {h['source']}"] if x)
+    fmt = "Online" if h["mode"] == "Fully online" else h["mode"]
+    plural = "" if int(d) == 1 else "s"
+    left = h["left"] or (f"{int(d)} day{plural} left" if d < 999 and h["source"] != "Web" else f"next date in {int(d)} day{plural}" if d < 999 else "")
+    chips = (['<span class="chip mychip">Malaysia</span>'] if h["malaysia"] else []) + \
+            [f'<span class="chip {h["level"]}" title="{e(h["level_why"])}">{h["level"]}</span>'] + prize_chips(p) + \
+            [f'<span class="chip">{e(team_label(h))}</span>', f'<span class="chip">{e(fmt[:60])}</span>'] + \
+            ([f'<span class="chip">{e(left)}</span>'] if left else []) + \
+            (['<span class="chip" title="The site did not respond this time, so this is from the previous check">from last check</span>']
+             if h.get("missed") else [])
+    new = f'<span class="new">NEW</span><span class="found">{found}</span>' if found else ""
+    long_fmt = f'<li class="mute">Format: {e(h["mode"])}</li>' if len(fmt) > 60 else ""
+    web_note = '<li class="mute">Found by web search: details were read from the event site automatically, so double-check them.</li>' if h["source"] == "Web" else ""
+    credonly = "1" if p["credits"] and not p["cash"] and not p["ai"] else "0"
+    return f"""<div class="item{' my' if h['malaysia'] else ''}" data-level="{h['level']}" data-cash="{p['cash_top']:.0f}" data-ai="{int(p['ai'])}" data-credonly="{credonly}" data-my="{int(h['malaysia'])}" data-days="{d}">
 <a class="t" href="{e(h['url'])}" target="_blank">{e(h['title'])}</a>{new}
 <div class="chips">{''.join(chips)}</div>
 <details><summary>Prizes &amp; requirements</summary>
 <h4>Prizes</h4><ul>{plines}</ul>
 <h4>Requirements</h4><ul>{reqs}
 <li class="mute">Why {h['level'].lower()}: {e(h['level_why'])}</li>{long_fmt}{web_note}
-<li class="mute">{e(more)}</li></ul></details></div>""")
-    REPORT_FILE.write_text(PAGE.format(count=len(items), my_count=sum(h["malaysia"] for h in items), rate=RATES["MYR"],
-                                       rows="".join(rows) or "<p>No matching hackathons right now.</p>",
-                                       stamp=datetime.now().strftime("%d %b %Y, %H:%M")), encoding="utf-8")
+<li class="mute">{e(more)}</li></ul></details></div>"""
 
 
 def show_updating():
     """Open the last report right away with an 'updating' banner; it reloads itself until the new one is written."""
     old = REPORT_FILE.read_text(encoding="utf-8") if REPORT_FILE.exists() else \
-        PAGE.format(count=0, my_count=0, rate=RATES["MYR"], rows="", stamp="never")
+        PAGE.format(count=0, my_count=0, rate=RATES["MYR"], new_count=0, all_count=0, new_hint="", new_rows="",
+                    rows="", stamp="never")
     REPORT_FILE.write_text(old.replace("<title>", '<meta http-equiv="refresh" content="4"><title>', 1)
                               .replace("<main>", '<main><div class="banner">Checking for new hackathons… this page reloads by itself.</div>', 1),
                            encoding="utf-8")
@@ -972,6 +1026,13 @@ def run():
     state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     state.setdefault("seen", {})
     state.setdefault("cache", {})
+    if "baseline" not in state:  # hackathons found on the setup day aren't "new"
+        first = min(state["seen"].values(), default=None)
+        if first:  # midnight after the setup day, in local (Malaysia) time
+            day = datetime.fromisoformat(first).astimezone().date() + timedelta(days=1)
+            state["baseline"] = datetime.combine(day, datetime.min.time()).astimezone().astimezone(timezone.utc).isoformat()
+        else:
+            state["baseline"] = datetime.now(timezone.utc).isoformat()
     load_rates(state)
 
     candidates = []
@@ -1025,7 +1086,7 @@ def run():
     state["items"] = {h["id"]: {k: v for k, v in h.items() if k not in ("text", "_prize_items")} for h in items}
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
-    write_report(items, {h["id"] for h in new})
+    write_report(items, state["seen"], state["baseline"])
     print(f"{len(items)} matching hackathons ({sum(h['malaysia'] for h in items)} in Malaysia, {len(new)} new, "
           f"{carried} kept from last check). Report: {REPORT_FILE}")
     notify(new)
