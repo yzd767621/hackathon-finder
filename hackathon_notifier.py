@@ -2,11 +2,11 @@
 Hackathon Notifier (free, no API keys, Python standard library + curl)
 
 Finds hackathons that are:
-  * free to join
   * open to university / degree students
   * online  -- or, if there is an in-person part (e.g. final presentation), located in Kuala Lumpur / Klang Valley
-and shows requirements, team size, difficulty (estimated) and a prize breakdown
-(cash in RM vs AI subscriptions vs credits). Malaysian hackathons are listed first.
+and shows requirements, team size, difficulty (estimated), a prize breakdown
+(cash in RM vs AI subscriptions vs credits), whether there is a registration fee, how many people
+take part and an estimated chance of winning cash. Malaysian hackathons are listed first.
 
 Sources: Devpost, Devfolio, MLH, Luma (KL), UniNet (uninet.my), GDG Malaysia chapters, Hackathon Radar,
 and a DuckDuckGo/Bing search for Malaysian
@@ -120,14 +120,41 @@ def team_size(text):
     return lo, hi
 
 
-def has_fee(text):
+def fee_info(text):
+    """None if free, else {"rm": fee in RM (0 = amount not found), "note": the text that mentions it}."""
     for m in re.finditer(FEE, text, re.I):
         before = text[max(0, m.start() - 40):m.start()].lower()
         after = text[m.end():m.end() + 25].lower()
         if re.search(r"\bno\b|free|without|waive|zero|not require|percuma|tiada", before + " " + after):
             continue
-        return True
-    return False
+        around = text[max(0, m.start() - 40):m.end() + 60]
+        if re.search(r"accommodation|hotel|travel|meal|parking|penginapan", before[-20:]):
+            continue  # optional costs of attending, not an entry fee
+        if not re.search(r"regist|particip|entry|entrance|ticket|per (team|person|pax|participant)|yuran", around, re.I):
+            continue  # e.g. a news site's unrelated "fees up to RM1 mil"
+        amounts = money_rm(text[m.start():m.end() + 80]) or money_rm(text[max(0, m.start() - 60):m.start()])
+        return {"rm": amounts[0] if amounts else 0,
+                "note": re.sub(r"\s+", " ", text[max(0, m.start() - 40):m.end() + 80]).strip()}
+    return None
+
+
+def fee_rm(amount, currency):
+    return amount / RATES.get(CUR_CODE.get(currency.upper(), currency.upper()), 1) * RATES["MYR"]
+
+
+# "500+ participants", "over 120 teams": the size of the crowd, when a page states it
+CROWD = re.compile(r"(\d[\d,]*)\s*\+?\s*(participants|hackers|registrants|developers|builders|innovators|peserta|teams|pasukan)\b", re.I)
+
+
+def crowd_from_text(text):
+    for m in CROWD.finditer(text):
+        before = text[max(0, m.start() - 25):m.start()].lower()
+        if re.search(r"top|shortlist|final|selected|best|winning|per team|each team", before):
+            continue  # finalists or a team-size rule, not the whole crowd
+        n, teams = int(m.group(1).replace(",", "")), m.group(2).lower() in ("teams", "pasukan")
+        if (5 if teams else 10) <= n <= 200000:
+            return {"n": n, "unit": "teams" if teams else "people", "src": "stated on the event page"}
+    return None
 
 
 def snippet(text, pattern, width=350):
@@ -235,7 +262,7 @@ def summarise_prizes(items):
             cash.append(rm)
         lines.append({"cat": cat, "title": title, "text": text[:220], "rm": rm})
     cats = {l["cat"] for l in lines}
-    return {"lines": lines[:25], "cash_top": max(cash, default=0), "cash_total": sum(cash),
+    return {"lines": lines[:25], "cash_top": max(cash, default=0), "cash_total": sum(cash), "cash_slots": len(cash),
             "ai": "ai" in cats, "credits": "credits" in cats, "cash": bool(cash) or "cash" in cats}
 
 
@@ -285,6 +312,39 @@ def difficulty(h, text):
     return level, "; ".join(reasons)
 
 
+PLACES = [r"champion|\b1st\b|first (place|prize)|\bjohan\b|grand prize|winner", r"\b2nd\b|second (place|prize)|(1st |first )?runner[- ]?up|naib johan",
+          r"\b3rd\b|third (place|prize)|(2nd|second) runner[- ]?up|ketiga", r"consolation|saguhati|honou?rable mention"]
+SUBMIT_RATE = 0.12  # on Devpost/Devfolio most people who register never submit a project
+LEVEL_FACTOR = {"Beginner": 1.0, "Intermediate": 0.65, "Advanced": 0.4}
+
+
+def win_estimate(h):
+    """Rough odds of winning *some* cash prize, and expected cash per team (minus any fee). None if no cash prize.
+    Odds = cash prizes / competing teams, scaled down for harder events. No site publishes this: it's a guide."""
+    p = h["prizes"]
+    if not p["cash_total"]:
+        return None
+    slots = max(h.get("cash_slots") or 0, p.get("cash_slots") or 0, 1)
+    lo, hi = h.get("team_min"), h.get("team_max")
+    team = (lo + hi) / 2 if lo and hi else min(hi, 3) if hi else max(lo, 3) if lo else 3
+    # typical field when nothing is stated: local events are far smaller than global online ones
+    typical = 25 if h["malaysia"] and not h["online"] else 50 if h["malaysia"] else 200
+    c = h.get("crowd")
+    if c:
+        teams = c["n"] if c["unit"] == "teams" else c["n"] / team * (SUBMIT_RATE if c["unit"] == "registered" else 1)
+        crowd = f'{c["n"]:,} {c["unit"]} ({c["src"]})'
+        if teams < typical / 5:  # registrations keep coming in until the deadline
+            teams, crowd = typical / 5, crowd + f", early count so assumed at least ~{typical // 5} teams"
+    else:
+        teams, crowd = typical, f"not stated, guessed ~{typical} teams"
+    teams = max(teams, slots + 1, 2)
+    chance = min(slots / teams, 0.5) * LEVEL_FACTOR.get(h["level"], 0.65)
+    fee = (h.get("fee") or {}).get("rm", 0)
+    ev = p["cash_total"] * chance / slots
+    return {"chance": chance, "one_in": max(1, round(1 / chance)), "teams": teams, "slots": slots, "crowd": crowd,
+            "guess": not c, "ev": ev, "net": ev - fee}
+
+
 # ---------------------------------------------------------------- sources
 def devpost_item(h, kind):
     loc = (h.get("displayed_location") or {}).get("location") or ""
@@ -299,6 +359,8 @@ def devpost_item(h, kind):
         "dates": h.get("submission_period_dates", ""), "left": h.get("time_left_to_submission", ""),
         "organizer": h.get("organization_name") or "", "listed_usd": amount,
         "themes": ", ".join(t["name"] for t in h.get("themes", [])),
+        "crowd": {"n": h["registrations_count"], "unit": "registered", "src": "Devpost"} if h.get("registrations_count") else None,
+        "cash_slots": (h.get("prizes_counts") or {}).get("cash") or 0,
     }
 
 
@@ -403,6 +465,7 @@ def devfolio():
                 "dates": f"{(s.get('starts_at') or '')[:10]} → {(s.get('ends_at') or '')[:10]}", "left": "",
                 "organizer": s.get("tagline") or "", "themes": ", ".join(s.get("hashtags") or []),
                 "_text": desc, "_team": (s.get("team_min"), s.get("team_size")), "_reqs": [elig] if elig else [],
+                "crowd": {"n": s["participants_count"], "unit": "registered", "src": "Devfolio"} if s.get("participants_count") else None,
                 "_prizes": [(p.get("name") or "", f"{p.get('name') or ''}: {p.get('desc') or ''}" if p.get("desc") else p.get("name") or "")
                             for p in s.get("prizes") or []],
             })
@@ -452,7 +515,7 @@ def prosemirror_text(node, out):
 
 
 def luma():
-    """Free hackathon-type events on Luma's Kuala Lumpur page."""
+    """Hackathon-type events on Luma's Kuala Lumpur page (free and paid)."""
     found = {}
     for q in ("hackathon", "buildathon", "hack", "datathon", "ideathon", "ctf", "game%20jam", "competition", "challenge"):
         try:
@@ -468,15 +531,18 @@ def luma():
     out = []
     for api_id, x in found.items():
         ev, tix = x["event"], x.get("ticket_info") or {}
-        if not tix.get("is_free"):
-            continue
+        price = tix.get("price") or {}
+        fee = None if tix.get("is_free") else {
+            "rm": fee_rm(price["cents"] / 100, price.get("currency", "usd")) if price.get("cents") else 0,
+            "note": "Paid ticket on Luma"}
         geo = ev.get("geo_address_info") or {}
         online = ev.get("location_type") == "online"
         loc = "Online" if online else ", ".join(p for p in [geo.get("sublocality"), geo.get("city_state") or geo.get("city")] if p)
         out.append({
             "id": f"luma:{api_id}", "source": "Luma", "title": ev["name"], "url": f"https://luma.com/{ev['url']}",
             "online": online, "location": loc, "dates": (ev.get("start_at") or "")[:10], "left": "",
-            "organizer": (x.get("calendar") or {}).get("name") or "", "themes": "", "_api_id": api_id,
+            "organizer": (x.get("calendar") or {}).get("name") or "", "themes": "", "_api_id": api_id, "_fee": fee,
+            "crowd": {"n": x["guest_count"], "unit": "people", "src": "Luma guest list"} if x.get("guest_count") else None,
         })
     return out
 
@@ -602,15 +668,20 @@ def uninet():
             "dates": f"register by {deadline[:10]}" if deadline else "registration deadline not stated",
             "organizer": (e.get("organizer") or {}).get("name") or "", "themes": kinds,
             "_text": html.unescape(e.get("description") or ""), "_free": e.get("isAccessibleForFree"),
+            "_price": (e.get("offers") or {}).get("price"), "_currency": (e.get("offers") or {}).get("priceCurrency") or "MYR",
         })
     return out
 
 
 def uninet_detail(h):
     """UniNet gives no location field: read online / KL from the description."""
-    text = h.pop("_text")
+    text, price, currency = h.pop("_text"), h.pop("_price"), h.pop("_currency")
     if h.pop("_free") is False:
-        return None
+        try:
+            amount = fee_rm(float(price), currency)
+        except (TypeError, ValueError):
+            amount = 0
+        h["_fee"] = {"rm": amount, "note": "UniNet lists this as a paid event"}
     blob = h["title"] + "\n" + text
     if re.search(r"\b(online|virtual|hybrid|remote|dalam talian)\b", blob, re.I):
         h["online"], h["location"] = True, "Online"
@@ -721,7 +792,6 @@ def web_detail(h):
 
 
 # ---------------------------------------------------------------- pipeline
-FEE_REJECTED = set()  # title keys of hackathons that charge a fee on any site
 REJECTED = set()  # ids a filter turned down this run (vs. pages that just failed to load)
 FAILED_SOURCES = set()  # sources that errored or only partly loaded this run
 
@@ -804,9 +874,9 @@ def evaluate(h, cache):
         lo, hi = team_size(text)
     if hi and hi > 20:  # e.g. "up to 100 participants" isn't a team size
         hi = None
-    if has_fee(text):
-        FEE_REJECTED.add(title_key(h["title"]))
-        return reject(h)
+    given, found = h.pop("_fee", None), fee_info(text)
+    h["fee"] = given if given and given["rm"] else found or given
+    h["crowd"] = h.get("crowd") or crowd_from_text(text)
     if re.search(NOT_STUDENT, text, re.I):
         return reject(h)
     ok, note = judge_location(h["online"], h["location"], text)
@@ -817,6 +887,8 @@ def evaluate(h, cache):
         re.search(MY_WORDS, " ".join([h["title"], h["location"], h["organizer"]]
                                      + ([text] if h["source"] == "UniNet" else [])), re.I)) or \
         any(re.search(r"\bRM\s?\d|\bMYR\b", l["text"]) for l in h["prizes"]["lines"])
+    if h["prizes"]["cash"] and not h.get("cash_slots"):  # free-text pages rarely give every prize an amount
+        h["cash_slots"] = sum(1 for pat in PLACES if re.search(pat, text, re.I))
     level, why = difficulty(h, text)
     h.update(text=text[:60000], reqs=reqs, team_min=lo, team_max=hi, mode=note, level=level, level_why=why,
              _prize_items=prize_items)
@@ -904,27 +976,39 @@ h4{{margin:10px 0 2px;font-size:13.5px}}
 .newsec{{background:var(--card);border:1px solid var(--line);border-top:3px solid #e5484d;border-radius:12px;padding:14px 14px 6px}}
 .newsec .item{{background:var(--bg)}} .newsec .count{{background:#e5484d;color:#fff}}
 .small{{font-size:13px;margin:2px 0 6px}} .found{{font-size:12px;color:#e5484d;font-weight:600;margin-left:6px}}
+.free{{color:var(--beg);background:var(--begbg);font-weight:600}} .paid{{color:var(--adv);background:var(--advbg);font-weight:600}}
+.odds{{color:var(--acc);background:var(--chip);font-weight:600}}
+.easysec{{background:var(--card);border:1px solid var(--line);border-top:3px solid var(--cash);border-radius:12px;padding:14px 14px 6px}}
+.easysec .item{{background:var(--bg)}} .easysec .count{{background:var(--cash);color:var(--card)}}
+.rank{{display:inline-block;min-width:22px;font-weight:700;color:var(--cash)}}
 </style></head><body><main><h1>Hackathon Finder</h1>
-<p class="sub">{count} free hackathons ({my_count} in Malaysia) · open to degree students · online, or in person in KL · updated {stamp}<br>
-Difficulty is an estimate and USD is converted at 1 USD = RM {rate:.2f}. Check the official rules before you register.</p>
+<p class="sub">{count} hackathons ({free_count} free, {paid_count} with a fee, {my_count} in Malaysia) · open to degree students · online, or in person in KL · updated {stamp}<br>
+Difficulty and win odds are estimates and USD is converted at 1 USD = RM {rate:.2f}. Check the official rules before you register.</p>
 <div class="bar" data-g="where"><b>Show</b><button class="on" data-f="all">All</button><button data-f="my">Malaysia only</button>
 <button data-f="cash">Cash prizes</button><button data-f="ai">AI subscription prizes</button><button data-f="nocred">Hide credits-only</button></div>
+<div class="bar" data-g="cost"><b>Cost</b><button class="on" data-f="all">Any</button><button data-f="free">Free only</button><button data-f="paid">Has a fee</button></div>
 <div class="bar" data-g="level"><b>Level</b><button class="on" data-f="all">Any</button><button data-f="Beginner">Beginner</button>
 <button data-f="Intermediate">Intermediate</button><button data-f="Advanced">Advanced</button>
-<select id="sort"><option value="m">Malaysia first</option><option value="d">Deadline</option><option value="p">Biggest cash prize</option></select></div>
+<select id="sort"><option value="m">Malaysia first</option><option value="d">Deadline</option><option value="o">Easiest to win cash</option>
+<option value="e">Best expected cash</option><option value="p">Biggest cash prize</option></select></div>
+<section class="sec easysec"><h2>Easiest cash to win <span class="count" data-for="easy">{easy_count}</span></h2>
+<p class="mute small">Best odds of winning a cash prize: few competing teams, several cash prizes, beginner-friendly. Top prize at least RM {easy_min:,};
+fees are subtracted from expected winnings. Odds are rough estimates.</p><div class="list" id="easy">{easy_rows}</div></section>
 <section class="sec newsec"><h2>New this week <span class="count" data-for="new">{new_count}</span></h2>
 <p class="mute small">Found in the last 7 days{new_hint}</p><div class="list" id="new">{new_rows}</div></section>
 <section class="sec"><h2>All hackathons <span class="count" data-for="all">{all_count}</span></h2><div class="list" id="all">{rows}</div></section></main>
 <script>
-const lists=[...document.querySelectorAll('.list')],sel={{where:'all',level:'all'}};
+const lists=[...document.querySelectorAll('.list')],sel={{where:'all',cost:'all',level:'all'}};
 function apply(){{lists.forEach(list=>{{let n=0;list.querySelectorAll('.item').forEach(i=>{{const d=i.dataset,w=sel.where;
 const okW=w==='all'||(w==='my'&&d.my==='1')||(w==='cash'&&+d.cash>0)||(w==='ai'&&d.ai==='1')||(w==='nocred'&&d.credonly!=='1');
-i.hidden=!(okW&&(sel.level==='all'||d.level===sel.level));n+=!i.hidden}});
+const okC=sel.cost==='all'||(sel.cost==='paid')===(d.paid==='1');
+i.hidden=!(okW&&okC&&(sel.level==='all'||d.level===sel.level));n+=!i.hidden}});
 document.querySelector('.count[data-for="'+list.id+'"]').textContent=n}})}}
 document.querySelectorAll('.bar[data-g]').forEach(bar=>bar.querySelectorAll('button').forEach(b=>b.onclick=()=>{{
 sel[bar.dataset.g]=b.dataset.f;bar.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));apply()}}));
-document.getElementById('sort').onchange=e=>{{const k=e.target.value;lists.forEach(list=>
-[...list.children].sort((a,b)=>k==='p'?b.dataset.cash-a.dataset.cash:k==='m'?(b.dataset.my-a.dataset.my)||(a.dataset.days-b.dataset.days):a.dataset.days-b.dataset.days).forEach(x=>list.appendChild(x)))}};
+document.getElementById('sort').onchange=e=>{{const k=e.target.value;lists.filter(l=>l.id!=='easy').forEach(list=>
+[...list.children].sort((a,b)=>k==='p'?b.dataset.cash-a.dataset.cash:k==='o'?b.dataset.odds-a.dataset.odds:k==='e'?b.dataset.ev-a.dataset.ev:
+k==='m'?(b.dataset.my-a.dataset.my)||(a.dataset.days-b.dataset.days):a.dataset.days-b.dataset.days).forEach(x=>list.appendChild(x)))}};
 </script></body></html>"""
 
 TAG_LABEL = {"cash": "CASH", "ai": "AI SUB", "credits": "CREDITS", "other": "OTHER"}
@@ -950,6 +1034,16 @@ def found_label(first_seen):
     return "found today" if days == 0 else "found yesterday" if days == 1 else f"found {days} days ago"
 
 
+EASY_MIN_PRIZE = 500  # RM; a near-certain win of RM 100 isn't worth a weekend
+EASY_COUNT = 8
+
+
+def easiest(items):
+    """Best odds of winning cash first, then the most expected cash; a fee bigger than the expected cash rules it out."""
+    picks = [(w, h) for h in items if (w := win_estimate(h)) and h["prizes"]["cash_top"] >= EASY_MIN_PRIZE and w["net"] > 0]
+    return [h for w, h in sorted(picks, key=lambda x: (-round(x[0]["chance"], 2), -x[0]["net"]))[:EASY_COUNT]]
+
+
 def write_report(items, seen, baseline):
     """Hackathons first seen in the last 7 days (after the initial setup batch) go in "New this week" at the top."""
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -957,17 +1051,37 @@ def write_report(items, seen, baseline):
     new_rows, rows = [], []
     for h in sorted(items, key=lambda h: (not h["malaysia"], days_left(h))):
         (new_rows if is_new(h) else rows).append(item_html(h, found_label(seen[h["id"]]) if is_new(h) else ""))
+    easy_rows = [item_html(h, "", rank=i) for i, h in enumerate(easiest(items), 1)]
     REPORT_FILE.write_text(PAGE.format(
         count=len(items), my_count=sum(h["malaysia"] for h in items), rate=RATES["MYR"],
+        free_count=sum(not h.get("fee") for h in items), paid_count=sum(bool(h.get("fee")) for h in items),
+        easy_count=len(easy_rows), easy_min=EASY_MIN_PRIZE,
+        easy_rows="".join(easy_rows) or "<p>No cash-prize hackathons right now.</p>",
         new_count=len(new_rows), all_count=len(rows),
         new_hint="" if new_rows else ". Nothing new yet: the app checks every day and will notify you.",
         new_rows="".join(new_rows), rows="".join(rows) or "<p>No matching hackathons right now.</p>",
         stamp=datetime.now().strftime("%d %b %Y, %H:%M")), encoding="utf-8")
 
 
-def item_html(h, found):
+def cost_chip(fee):
+    if not fee:
+        return '<span class="chip free">Free</span>'
+    label = f"Fee: {rm(fee['rm'])}" if fee["rm"] else "Has a fee (amount not stated)"
+    return f'<span class="chip paid" title="{html.escape(fee["note"])}">{label}</span>'
+
+
+def win_why(w):
+    s = (f'About 1 in {w["one_in"]} chance of a cash prize: {w["slots"]} cash prize{"s" if w["slots"] > 1 else ""} '
+         f'for ~{w["teams"]:,.0f} competing teams (participants: {w["crowd"]}), adjusted for difficulty. '
+         f'Expected cash per team ≈ {rm(w["ev"])}')
+    if w["net"] == w["ev"]:
+        return s + "."
+    return s + (f', or {rm(w["net"])} after the fee.' if w["net"] > 0 else ", less than the fee.")
+
+
+def item_html(h, found, rank=0):
     e = html.escape
-    p, d = h["prizes"], days_left(h)
+    p, d, w, fee = h["prizes"], days_left(h), win_estimate(h), h.get("fee")
     reqs = "".join(f"<li>{e(r)}</li>" for r in h["reqs"]) or "<li>See the event page</li>"
     plines = "".join(
         f'<li><span class="tag {l["cat"]}">{TAG_LABEL[l["cat"]]}</span>'
@@ -980,8 +1094,12 @@ def item_html(h, found):
     fmt = "Online" if h["mode"] == "Fully online" else h["mode"]
     plural = "" if int(d) == 1 else "s"
     left = h["left"] or (f"{int(d)} day{plural} left" if d < 999 and h["source"] != "Web" else f"next date in {int(d)} day{plural}" if d < 999 else "")
-    chips = (['<span class="chip mychip">Malaysia</span>'] if h["malaysia"] else []) + \
-            [f'<span class="chip {h["level"]}" title="{e(h["level_why"])}">{h["level"]}</span>'] + prize_chips(p) + \
+    c = h.get("crowd")
+    odds = ([f'<span class="chip odds" title="{e(win_why(w))}">Win odds ~1 in {w["one_in"]}'
+             f'{" (guess)" if w["guess"] else ""}</span>'] if w else [])
+    crowd = [f'<span class="chip">{c["n"]:,} {c["unit"]}</span>'] if c else []
+    chips = (['<span class="chip mychip">Malaysia</span>'] if h["malaysia"] else []) + [cost_chip(fee)] + \
+            [f'<span class="chip {h["level"]}" title="{e(h["level_why"])}">{h["level"]}</span>'] + prize_chips(p) + odds + crowd + \
             [f'<span class="chip">{e(team_label(h))}</span>', f'<span class="chip">{e(fmt[:60])}</span>'] + \
             ([f'<span class="chip">{e(left)}</span>'] if left else []) + \
             (['<span class="chip" title="The site did not respond this time, so this is from the previous check">from last check</span>']
@@ -990,11 +1108,16 @@ def item_html(h, found):
     long_fmt = f'<li class="mute">Format: {e(h["mode"])}</li>' if len(fmt) > 60 else ""
     web_note = '<li class="mute">Found by web search: details were read from the event site automatically, so double-check them.</li>' if h["source"] == "Web" else ""
     credonly = "1" if p["credits"] and not p["cash"] and not p["ai"] else "0"
-    return f"""<div class="item{' my' if h['malaysia'] else ''}" data-level="{h['level']}" data-cash="{p['cash_top']:.0f}" data-ai="{int(p['ai'])}" data-credonly="{credonly}" data-my="{int(h['malaysia'])}" data-days="{d}">
-<a class="t" href="{e(h['url'])}" target="_blank">{e(h['title'])}</a>{new}
+    fee_li = f'<li>{e(fee["note"])}</li>' if fee else "<li>No registration fee found.</li>"
+    win_li = f"<li>{e(win_why(w))}</li>" if w else "<li>No cash prize, so no win estimate.</li>"
+    num = f'<span class="rank">{rank}.</span>' if rank else ""
+    return f"""<div class="item{' my' if h['malaysia'] else ''}" data-level="{h['level']}" data-cash="{p['cash_top']:.0f}" data-ai="{int(p['ai'])}" data-credonly="{credonly}" data-my="{int(h['malaysia'])}" data-days="{d}" data-paid="{int(bool(fee))}" data-odds="{w['chance'] if w else 0:.4f}" data-ev="{w['net'] if w else 0:.0f}">
+{num}<a class="t" href="{e(h['url'])}" target="_blank">{e(h['title'])}</a>{new}
 <div class="chips">{''.join(chips)}</div>
-<details><summary>Prizes &amp; requirements</summary>
+<details><summary>Prizes, odds &amp; requirements</summary>
 <h4>Prizes</h4><ul>{plines}</ul>
+<h4>Chance of winning cash</h4><ul>{win_li}</ul>
+<h4>Cost</h4><ul>{fee_li}</ul>
 <h4>Requirements</h4><ul>{reqs}
 <li class="mute">Why {h['level'].lower()}: {e(h['level_why'])}</li>{long_fmt}{web_note}
 <li class="mute">{e(more)}</li></ul></details></div>"""
@@ -1003,7 +1126,8 @@ def item_html(h, found):
 def show_updating():
     """Open the last report right away with an 'updating' banner; it reloads itself until the new one is written."""
     old = REPORT_FILE.read_text(encoding="utf-8") if REPORT_FILE.exists() else \
-        PAGE.format(count=0, my_count=0, rate=RATES["MYR"], new_count=0, all_count=0, new_hint="", new_rows="",
+        PAGE.format(count=0, my_count=0, free_count=0, paid_count=0, rate=RATES["MYR"], easy_count=0,
+                    easy_min=EASY_MIN_PRIZE, easy_rows="", new_count=0, all_count=0, new_hint="", new_rows="",
                     rows="", stamp="never")
     REPORT_FILE.write_text(old.replace("<title>", '<meta http-equiv="refresh" content="4"><title>', 1)
                               .replace("<main>", '<main><div class="banner">Checking for new hackathons… this page reloads by itself.</div>', 1),
@@ -1050,13 +1174,16 @@ def run():
 
     with cf.ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda h: evaluate(h, state["cache"]), candidates))
+    # a fee mentioned on any site that lists the hackathon counts
+    paid = {title_key(h["title"]): h["fee"] for h in results if h and h["fee"]}
     items, keys = [], set()
     for h in results:  # drop duplicates (same hackathon found on two sites)
         if not h:
             continue
         key = title_key(h["title"])
-        if key in keys or key in FEE_REJECTED:
+        if key in keys:
             continue
+        h["fee"] = h["fee"] or paid.get(key)
         keys.add(key)
         items.append(h)
 
@@ -1065,7 +1192,7 @@ def run():
     current, tried = {h["id"] for h in items}, {h["id"] for h in candidates}
     for pid, old in state.get("items", {}).items():
         key = title_key(old["title"])
-        if pid in current or pid in REJECTED or key in keys or key in FEE_REJECTED or old.get("missed", 0) >= 3:
+        if pid in current or pid in REJECTED or key in keys or old.get("missed", 0) >= 3:
             continue
         if pid not in tried and old["source"] not in FAILED_SOURCES and old["source"].lower() not in FAILED_SOURCES:
             continue  # its site loaded fine and no longer lists it
